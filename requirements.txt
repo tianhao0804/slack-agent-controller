@@ -1,0 +1,5 @@
+# Runtime (Python >= 3.11)
+claude-agent-sdk==0.2.182   # bundles Claude Code CLI 2.1.325
+slack_bolt==1.30.0
+slack_sdk==3.47.0
+aiohttp==3.14.5

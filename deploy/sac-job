@@ -1,0 +1,7 @@
+#!/bin/sh
+# sac-job: long computations tracked by the Slack bot (see deploy/sac_job.py or `sac-job --help`).
+# Standard library only: uses the repository's .venv if present, else python3 from PATH.
+here=$(dirname "$(readlink -f "$0")")
+py="$here/../.venv/bin/python"
+[ -x "$py" ] || py=$(command -v python3)
+exec "$py" -I "$here/sac_job.py" "$@"

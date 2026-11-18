@@ -1,0 +1,37 @@
+# Slack app manifest for slack-agent-controller (Socket Mode: no public URL needed).
+# api.slack.com/apps -> Create New App -> From a manifest -> paste this, then install it to your workspace.
+# Rename display_information.name / bot_user.display_name as you like; do not call it "Claude Code"
+# (Anthropic's Agent SDK branding guidelines).
+display_information:
+  name: Agent Controller
+  description: Run a Claude agent on your own server from Slack (powered by Claude)
+  background_color: "#2c2d30"
+features:
+  app_home:
+    home_tab_enabled: true      # overview: needs-you, active sessions, jobs, GPUs, projects
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false   # required so you can DM the bot
+  bot_user:
+    display_name: agent-controller
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write        # post / update messages, approval and question cards
+      - im:history        # receive DM messages (message.im)
+      - im:read           # DM channel info
+      - im:write          # open a DM (reminders, Home tab "New session")
+      - files:write       # long outputs, !upload, mirrored turn logs
+      - files:read        # files you attach (screenshots, logs, PDFs) so Claude can read them
+      - groups:history    # optional: messages in private channels listed in ALLOWED_CHANNEL_IDS
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - message.groups
+      - app_home_opened   # publish the Home tab when it is opened
+  interactivity:
+    is_enabled: true      # Block Kit buttons (delivered over Socket Mode)
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
