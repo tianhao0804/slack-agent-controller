@@ -21,20 +21,29 @@ These are evaluated in a `PreToolUse` hook on every tool call. Claude Code setti
 loaded, so their allow-rules cannot bypass the checks.
 
 1. **Hard denials.** Approvals cannot override these.
-   - Reading or writing protected paths: `~/.ssh`, `~/.aws`, `~/.claude` (except the session's own
-     memory folder), `~/.config/slack-agent-controller`, the bot's state directory, `~/.gnupg`,
-     `~/.netrc`, and more.
+   - Reading or writing protected paths with the file tools: `~/.ssh`, `~/.aws`, `~/.claude`,
+     `~/.config/slack-agent-controller`, the bot's state directory, `~/.gnupg`, `~/.netrc`, and
+     more. The session's own memory folder is open. In `auto` mode the rest of `~/.claude` (job
+     scratch folders, transcripts, other projects' notes) is left to the classifier; Claude Code's
+     `settings*.json` and `.credentials.json` stay denied.
    - Protected file names anywhere: `.env`, `*.pem`, `*.key`, `id_rsa*`, `.git-credentials`, and
      more. Add your own with `EXTRA_SENSITIVE_PATHS` and `EXTRA_SENSITIVE_GLOBS`.
    - Shell commands that name provider credentials (`AWS_SECRET_ACCESS_KEY`,
      `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_API_KEY`, …) or `/proc/*/environ`.
    - Writes outside `CWD_ROOTS`.
-2. **Always asked in Slack**, even in `auto` mode and even after "Approve all":
-   - shell commands that name protected files, also through wildcards, brace expansion, `~` or
-     `$HOME` (`cat .e*` and `cat .{e,}nv` are both caught);
-   - commands that may dump the environment or send data off the machine (`env`, `printenv`,
-     `curl`, `wget`, `scp`, …);
+2. **Always asked in Slack**, even after "Approve all":
+   - shell commands that name protected files, also through wildcards, brace expansion, `~`,
+     `$HOME`, `..` or symlinks (`cat .e*` and `cat .{e,}nv` are both caught);
+   - commands that may dump the environment (`env`, `printenv`, `os.environ`, …);
    - searches whose scope or glob filter can reach protected files.
+
+   In `ask` mode this covers every protected path and also network transfers (`curl`, `wget`,
+   `scp`, …). In `auto` mode only a short list counts, so it feels like auto mode in the terminal:
+   secrets (`~/.ssh`, `~/.aws`, `.env`, `*.pem`, the bot's env file, …), files that control
+   permissions (Claude Code `settings*.json` and `.credentials.json`, `~/.claude.json`, the bot's
+   state directory), directories that hold them (`cd ~/.claude && cat settings.json`), and
+   environment dumps. Network transfers and the rest of `~/.claude` go to the classifier, as in
+   the terminal.
 3. **Everything else** with side effects needs a button tap in `ask` mode. In `auto` mode it goes to
    Claude Code's auto-mode classifier.
    - The classifier treats an explicit request in your prompt as permission. That is why the checks

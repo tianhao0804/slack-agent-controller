@@ -13,3 +13,7 @@ env
 dist/
 build/
 *.egg-info/
+
+# Local, never published: personal notes for Claude Code and per-machine settings
+CLAUDE.local.md
+.claude/settings.local.json

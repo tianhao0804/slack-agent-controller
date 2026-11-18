@@ -25,8 +25,9 @@ workspace run code on your machine. Its safeguards reduce that risk, but they do
   commands that are safe to repeat. Unanswered cards are denied after 30 minutes. There are two
   modes per thread:
   - `ask`: you approve every action that has side effects;
-  - `auto`: Claude Code's auto-mode classifier approves routine actions, but protected files,
-    credentials, environment dumps and network transfers still come to Slack.
+  - `auto`: Claude Code's auto-mode classifier judges actions, like auto mode in the terminal.
+    A short list still comes to Slack: secrets, files that control permissions (Claude Code
+    settings, the bot's own config and state) and environment dumps.
 - **Hard limits that approvals cannot override.** Secrets and config paths (`~/.ssh`, `~/.aws`,
   `.env`, `*.pem`, the bot's own files, ...) are blocked, also when a shell wildcard or brace
   expansion would reach them. Commands that reference credentials are denied. Work is confined to
@@ -138,6 +139,7 @@ session; replies in its thread continue it.
 | `!upload <path>` | Attach a file from the session's directory |
 | `!resume <id>` · `!import <id…>` · `!fork` | Attach a terminal session · import sessions with their last exchanges · branch this session |
 | `!exit` | Close this thread's agent process so the session can be used in a terminal |
+| `!compact [what to keep]` | Summarize the conversation to free up context (also happens automatically when it fills up) |
 | `!end` | End this session and unbind the thread (the transcript is kept) |
 | `!unlock` | Release a stale terminal lock |
 | `!help` | All commands |

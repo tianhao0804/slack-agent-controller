@@ -45,6 +45,7 @@ HELP = """\
 • `!upload <path>` — attach a file from the session's directory
 • `!mode [auto|ask]` — per-thread permissions: `ask` = approve with buttons, `auto` = Claude Code auto-mode classifier
 • `!allowlist [remove <id>|clear]` — Bash commands you chose to remember (exact text + directory) and no longer ask; list or revoke them
+• `!compact [what to keep]` — (in a thread) summarize the conversation to free up context (also happens automatically when it fills up)
 • `!end` — (in a thread) end this session: unbind the thread and stop mirroring it (transcript kept)
 • `!exit` — (in a thread) close this thread's Claude Code process now so the session can be used in a terminal; reply here later to continue
 • `!unlock` — (in a thread) release a stale terminal lock (refused while the terminal process still runs; `!unlock force` overrides)
@@ -994,6 +995,14 @@ class SlackFrontend:
         lines.append("_Built-in read-only (any directory): " + ", ".join(f"`{c}`" for c in sorted(al.seeds)) + "_")
         lines.append("_Never remembered: commands with warnings, deletes/moves/kills, or shell expansion ($, *, ?)._")
         await self.hub.post(channel, reply_to, "\n".join(lines))
+
+    async def _cmd_compact(self, channel: str, ts: str, thread_ts: str | None, user: str, arg: str) -> None:
+        """`!compact [focus]` -> the CLI's `/compact [focus]` (Slack would swallow a typed `/compact`).
+        It goes through the normal prompt path: terminal lock, queue limit and approvals all apply."""
+        if not thread_ts or self.hub.store.get(thread_key(channel, thread_ts)) is None:
+            await self.hub.post(channel, thread_ts or ts, "Use `!compact` inside a session thread.")
+            return
+        await self._prompt(channel, ts, thread_ts, user, ("/compact " + arg).strip())
 
     async def _cmd_end(self, channel: str, ts: str, thread_ts: str | None, user: str, arg: str) -> None:
         """End this thread's session: works for any root, including ones the bot posted (review R10)."""

@@ -20,6 +20,7 @@ import asyncio
 import collections
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -162,6 +163,8 @@ class TurnRenderer:
         self._lock = asyncio.Lock()
         # Buttons under the reply: controls(final) -> Block Kit elements (set by the session).
         self.controls: Callable[[bool], list[dict[str, Any]]] | None = None
+        # Model/effort in effect, e.g. "`opus-5-5` · effort `high`" (set by the session).
+        self.tag: Callable[[], str] | None = None
 
     # -- accumulation ------------------------------------------------------
     def delta(self, text: str) -> None:
@@ -247,6 +250,9 @@ class TurnRenderer:
     def _compose(self, footer: str | None) -> str:
         body = self.render()
         foot = footer if footer is not None else f"_{self.status}  ·  `!stop` to interrupt_"
+        tag = self.tag() if self.tag else ""
+        if tag:
+            foot += f"  ·  {tag}"
         # Keep the end: on a phone the conclusion matters most; the full text is attached when cut.
         body = tail_text(body, MSG_LIMIT - len(foot) - 4)
         return f"{body}\n\n{foot}" if body else foot
@@ -283,7 +289,8 @@ class TurnRenderer:
             self.parts.append({"kind": "text", "text": self.live})
             self.live = ""
         full = self.render()
-        too_long = len(full) > MSG_LIMIT - len(footer) - 4
+        tag = self.tag() if self.tag else ""
+        too_long = len(full) > MSG_LIMIT - len(footer) - len(tag) - 10
         if too_long:
             footer = footer + "  ·  full output attached :paperclip:"
         # The final text must arrive (review R4): retry, then fall back to a new message.
@@ -309,6 +316,38 @@ class TurnRenderer:
                 # On a phone the conclusion is what matters: give it its own clean message.
                 body = head_text(md_to_mrkdwn(policy.redact_log(last.strip())), MSG_LIMIT - 40)
                 await self.hub.post(self.channel, self.thread_ts, ":pushpin: *Final answer*\n" + body)
+
+
+def short_model(model: str) -> str:
+    """`us.anthropic.claude-opus-5-5-v1:0` -> `opus-5-5`."""
+    m = model.rsplit("anthropic.", 1)[-1]
+    m = re.sub(r"-v\d+(:\d+)?$", "", m)
+    return m.removeprefix("claude-")
+
+
+def tail_model_effort(path: Path | None, max_bytes: int = 512 * 1024) -> tuple[str | None, str | None]:
+    """(model, effort) of the last assistant entry in a transcript, reading only its tail."""
+    if path is None:
+        return None, None
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            lines = fh.read().splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        if b'"assistant"' not in line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("type") == "assistant":
+            model = e.get("requestedModel") or (e.get("message") or {}).get("model")
+            return (str(model) if model else None), (str(e["effort"]) if e.get("effort") else None)
+    return None, None
 
 
 @dataclass
@@ -355,6 +394,8 @@ class ThreadSession:
         self._last_activity = time.monotonic()
         self._proc_cost = 0.0  # cumulative cost reported by the current CLI process
         self._options_stale = False  # model/effort changed while a CLI process is running
+        self.live_model: str | None = None   # from the CLI's init message / transcript
+        self.live_effort: str | None = None  # from PreToolUse input / transcript
         self.last_task_id: str | None = None
         self.last_event = time.monotonic()        # last message from the CLI (stall detection)
         self.open_tools: dict[str, str] = {}      # tool_use_id -> one-line summary, until its result arrives
@@ -538,7 +579,8 @@ class ThreadSession:
         note = SLACK_SYSTEM_NOTE + (JOBS_NOTE.replace("{sac_job}", str(SAC_JOB)) if self.cfg.jobs_enabled else "")
         parts = [note,
                  f"Your auto-memory directory for this project is {self.memory_dir}; you may read and write "
-                 "notes there with Read/Write/Edit (never secrets). The rest of ~/.claude stays off-limits."]
+                 "notes there with Read/Write/Edit (never secrets). Claude Code settings and credentials in ~/.claude "
+                 "stay off-limits."]
         if self.cfg.load_claude_md:
             # setting_sources=[] disables the CLI's own CLAUDE.md loading (it
             # would also load settings files whose allow-rules bypass Slack
@@ -759,6 +801,7 @@ class ThreadSession:
         turn = _Turn(TurnRenderer(self.hub, self.rec.channel, self.rec.thread_ts, self.cwd),
                      owner=item.user, started=time.monotonic(), autonomous=False)
         turn.renderer.controls = self.controls
+        turn.renderer.tag = self.model_tag
         self._begin(turn)
         try:
             await turn.renderer.start()
@@ -826,6 +869,7 @@ class ThreadSession:
             turn = _Turn(TurnRenderer(self.hub, self.rec.channel, self.rec.thread_ts, self.cwd),
                          owner=self.turn_owner, started=time.monotonic(), autonomous=True)
             turn.renderer.controls = self.controls
+            turn.renderer.tag = self.model_tag
             self._begin(turn)
             await turn.renderer.start()
             turn.renderer.note("Claude continued on its own")
@@ -882,6 +926,10 @@ class ThreadSession:
         rec.last_active = time.time()
         self.hub.store.put(rec)
         self._baseline = await self._transcript_size()
+
+        used_model, used_effort = await asyncio.to_thread(tail_model_effort, self._transcript_file())
+        self.live_model = used_model or self.live_model
+        self.live_effort = used_effort or self.live_effort
 
         cost = f"${rec.cost_usd:.2f} total"
         if error:
@@ -971,6 +1019,9 @@ class ThreadSession:
                 if self.rec.mode == "auto" and pm and pm != "auto":
                     r.note(f"auto mode is not available for this model; using Slack approvals (mode {pm})")
                 model = str(msg.data.get("model", ""))
+                if model:
+                    self.live_model = model
+                    r._dirty = True
                 if model and self.cfg.provider == "bedrock" and not self.hub.bedrock_model_ok(model):
                     r.note(f"warning: model id {model} does not look like a Bedrock id")
             elif msg.subtype == "compact_boundary":
@@ -981,11 +1032,14 @@ class ThreadSession:
         tool = str(inp.get("tool_name", ""))
         tin = inp.get("tool_input") or {}
         cwd = Path(inp.get("cwd") or self.rec.cwd)
+        eff = inp.get("effort")
+        if isinstance(eff, dict) and eff.get("level") and not inp.get("agent_id"):
+            self.live_effort = str(eff["level"])
         if tool == "AskUserQuestion":
             # Always reach can_use_tool, where the questions are shown in Slack (also in auto mode).
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                            "permissionDecisionReason": "question for the user"}}
-        res = policy.decide(self.cfg, tool, tin, cwd, self.memory_dir)
+        res = policy.decide(self.cfg, tool, tin, cwd, self.memory_dir, auto=self.rec.mode == "auto")
         if res.decision == "ask" and tool == "Bash":
             why = self.hub.allowlist.allowed(tin, cwd)
             if why:
@@ -1061,11 +1115,21 @@ class ThreadSession:
                                  id=ent.id, by=user, cwd=ent.cwd, input=policy.audit_summary("Bash", tin))
 
     def _force_slack(self, tool: str, tin: dict[str, Any], cwd: Path | None = None) -> bool:
-        """In auto mode, still require a Slack tap for commands that could leak the
-        environment, send data off-node, or name protected files (after expanding
-        braces, ~ and wildcards)."""
-        return tool == "Bash" and bool(
-            policy.bash_warnings(self.cfg, str(tin.get("command", "")), cwd or self.cwd))
+        """Bash calls that need a Slack tap whatever was approved before. Auto mode: only
+        environment dumps and the short list of secret/permission files (after expanding
+        braces, ~ and wildcards). Ask mode ("Approve all"): any warning at all."""
+        if tool != "Bash":
+            return False
+        cmd = str(tin.get("command", ""))
+        if self.rec.mode == "auto":
+            return bool(policy.auto_bash_warnings(self.cfg, cmd, cwd or self.cwd))
+        return bool(policy.bash_warnings(self.cfg, cmd, cwd or self.cwd))
+
+    def model_tag(self) -> str:
+        """Model and effort this reply runs with (what the CLI reports; else what it was started with)."""
+        model = self.live_model or self.rec.model or self.cfg.model
+        effort = self.live_effort or self.rec.effort or self.cfg.default_effort
+        return f":brain: `{short_model(model) if model else 'default'}` · effort `{effort or 'default'}`"
 
     def set_model_effort(self, model: str | None = None, effort: str | None = None,
                          clear_model: bool = False, clear_effort: bool = False) -> str:
@@ -1120,7 +1184,8 @@ class ThreadSession:
     async def _can_use_tool(self, tool: str, tin: dict[str, Any], ctx: ToolPermissionContext) -> PermissionResult:
         if tool == "AskUserQuestion":
             return await self.hub.ask_questions(self, tin)
-        res = policy.decide(self.cfg, tool, tin, self.cwd, self.memory_dir)
+        res = policy.decide(self.cfg, tool, tin, self.cwd, self.memory_dir,
+                            auto=self.rec.mode == "auto")
         audit = dict(session=self.rec.session_id, thread=self.rec.key, agent=ctx.agent_id, tool=tool,
                      input=policy.audit_summary(tool, tin))
         if res.decision == "deny":

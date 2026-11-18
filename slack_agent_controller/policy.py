@@ -79,6 +79,43 @@ def contains_sensitive(cfg: Config, p: Path) -> bool:
     return any(s.is_relative_to(p) for s in cfg.sensitive_paths)
 
 
+# Auto mode lets the CLI's classifier judge everything except a short list: real
+# secrets, and the files that would let Claude widen its own permissions (Claude
+# Code settings/credentials, the bot's env file and state). In practice that is
+# every protected path except ~/.claude as a whole, where only these files stay.
+CLAUDE_CRITICAL_FILES = ("settings.json", "settings.local.json", ".credentials.json")
+
+
+def _claude_dir() -> Path:
+    return Path(os.path.realpath(Path.home() / ".claude"))
+
+
+def critical_paths(cfg: Config) -> tuple[Path, ...]:
+    claude = _claude_dir()
+    out = [s for s in cfg.sensitive_paths if s != claude]
+    if claude in cfg.sensitive_paths:
+        out += [claude / n for n in CLAUDE_CRITICAL_FILES]
+    return tuple(dict.fromkeys(out))
+
+
+def is_critical(cfg: Config, p: Path) -> bool:
+    """``p`` (resolved) is a secret or a permission file: always confirmed in Slack."""
+    for s in critical_paths(cfg):
+        if p == s or p.is_relative_to(s):
+            return True
+    return any(fnmatch.fnmatch(p.name, g) for g in cfg.sensitive_globs)
+
+
+def holds_critical(cfg: Config, p: Path, skip_home: bool = True) -> bool:
+    """Directory ``p`` holds a critical path (``cd ~/.claude; cat settings.json``).
+    For Bash words $HOME and its ancestors are left out (too common; the name checks
+    cover them); search scopes pass ``skip_home=False``."""
+    home = Path(os.path.realpath(Path.home()))
+    if skip_home and (p == home or home.is_relative_to(p)):
+        return False
+    return any(s.is_relative_to(p) and s != p for s in critical_paths(cfg))
+
+
 def target_paths(tool: str, inp: dict[str, Any], cwd: Path) -> list[Path]:
     paths: list[Path] = []
     for k in _PATH_KEYS:
@@ -102,10 +139,12 @@ def target_paths(tool: str, inp: dict[str, Any], cwd: Path) -> list[Path]:
 # could dump the environment get a warning on the approval card.
 _BASH_DENY = re.compile(r"AWS_BEARER_TOKEN_BEDROCK|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|ANTHROPIC_API_KEY"
                         r"|ANTHROPIC_AUTH_TOKEN|/proc/[^\s/]+/environ")
-_BASH_WARN = re.compile(
+_ENV_DUMP = (
     r"(^|[;&|`(]\s*|\$\(\s*)(env|printenv|set|export\s+-p|declare\s+-[a-z]*x|compgen\s+-e)\s*($|[;&|)>])"
-    r"|\bos\.environ\b|process\.env\b|\b(aws|curl|wget|nc|ncat|scp|rsync)\b"
+    r"|\bos\.environ\b|process\.env\b"
 )
+_BASH_ENV = re.compile(_ENV_DUMP)
+_BASH_WARN = re.compile(_ENV_DUMP + r"|\b(aws|curl|wget|nc|ncat|scp|rsync)\b")
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +280,10 @@ def _expand_paths(word: str, cwd: Path) -> list[Path]:
     return out
 
 
-def word_warnings(cfg: Config, command: str, cwd: Path) -> list[str]:
+def word_warnings(cfg: Config, command: str, cwd: Path, critical: bool = False) -> list[str]:
     """Protected files/dirs the command's words name once expanded (names such as
-    ``.env`` and ``*.pem`` count, not only the configured paths)."""
+    ``.env`` and ``*.pem`` count, not only the configured paths). With ``critical``
+    only the auto-mode short list counts, plus directories that hold an item of it."""
     home = str(Path.home())
     warns: list[str] = []
     budget = _PATH_BUDGET
@@ -267,7 +307,16 @@ def word_warnings(cfg: Config, command: str, cwd: Path) -> list[str]:
                     if _UNCHECKABLE not in warns:
                         warns.append(_UNCHECKABLE)
                     continue
-                if is_sensitive(cfg, rp):
+                if critical:
+                    hit = is_critical(cfg, rp)
+                    if not hit and holds_critical(cfg, rp):
+                        msg = f"names a directory holding protected files: {str(rp).replace(home, '~', 1)}"
+                        if msg not in warns:
+                            warns.append(msg)
+                        continue
+                else:
+                    hit = is_sensitive(cfg, rp)
+                if hit:
                     msg = f"names protected path {str(rp).replace(home, '~', 1)}"
                     if msg not in warns:
                         warns.append(msg)
@@ -287,6 +336,22 @@ def bash_warnings(cfg: Config, command: str, cwd: Path | None = None) -> list[st
             warns.append(f"references protected path {sp.replace(home, '~', 1)}")
     if cwd is not None:
         warns += [w for w in word_warnings(cfg, command, cwd) if w not in warns]
+    return warns
+
+
+def auto_bash_warnings(cfg: Config, command: str, cwd: Path) -> list[str]:
+    """Reasons a Bash command must still be confirmed in Slack in auto mode: it may
+    dump the environment, or it names a secret or permission file (after expansion).
+    Network use and the rest of ~/.claude are left to the CLI's classifier."""
+    warns: list[str] = []
+    if _BASH_ENV.search(command):
+        warns.append("may expose environment variables (incl. the model provider's API key)")
+    home = str(Path.home())
+    for s in critical_paths(cfg):
+        sp = str(s)
+        if sp in command or sp.replace(home, "~", 1) in command or sp.replace(home, "$HOME", 1) in command:
+            warns.append(f"references protected path {sp.replace(home, '~', 1)}")
+    warns += [w for w in word_warnings(cfg, command, cwd, critical=True) if w not in warns]
     return warns
 
 
@@ -337,16 +402,31 @@ def in_memory_dir(p: Path, memory_dir: Path | None) -> bool:
     return p == real_mem or p.is_relative_to(real_mem)
 
 
-def decide(cfg: Config, tool: str, inp: dict[str, Any], cwd: Path, memory_dir: Path | None = None) -> PolicyResult:
+def decide(cfg: Config, tool: str, inp: dict[str, Any], cwd: Path, memory_dir: Path | None = None,
+           auto: bool = False) -> PolicyResult:
+    """``auto``: the thread is in auto mode, where only critical paths (secrets and
+    permission files) stay blocked/forced to Slack and the classifier judges the rest."""
     if tool == "Bash" and _BASH_DENY.search(str(inp.get("command", ""))):
         return PolicyResult("deny", "Commands that reference cloud credentials or process environments are blocked by the Slack bot policy.")
     paths = target_paths(tool, inp, cwd)
     if tool in MEMORY_TOOLS and paths and memory_dir is not None and all(in_memory_dir(p, memory_dir) for p in paths):
         # The user opened this project's auto-memory notes (and only those) to the session.
         return PolicyResult("allow", "this project's auto-memory directory")
+    soft = []
     for p in paths:
         if is_sensitive(cfg, p):
+            if auto and not is_critical(cfg, p):
+                soft.append(p)
+                continue
             return PolicyResult("deny", f"{p} is a protected path (secrets/config); access blocked by the Slack bot policy.")
+    if soft:
+        if tool in ("Grep", "Glob", "LS") and any(holds_critical(cfg, p, skip_home=False) for p in paths):
+            return PolicyResult("ask", "search scope contains protected files", force_slack=True)
+        if tool == "Grep" and glob_targets_protected(cfg, str(inp.get("glob") or "")):
+            return PolicyResult("ask", "the glob filter can select protected files", force_slack=True)
+        if tool in WRITE_TOOLS or tool in READ_ONLY_TOOLS or tool in cfg.auto_allow_tools:
+            # Not a secret: the CLI's auto-mode classifier decides (a Slack card if it asks).
+            return PolicyResult("ask", f"{soft[0]} is under ~/.claude; left to the auto-mode classifier")
 
     if tool in WRITE_TOOLS:
         for p in paths:
@@ -358,7 +438,9 @@ def decide(cfg: Config, tool: str, inp: dict[str, Any], cwd: Path, memory_dir: P
         for p in paths:
             if not cfg.readable(p):
                 return PolicyResult("ask", f"{p} is outside the allowed roots")
-            if tool in ("Grep", "Glob", "LS") and contains_sensitive(cfg, p):
+            scope_hit = (holds_critical(cfg, p, skip_home=False) or is_critical(cfg, p)) if auto \
+                else contains_sensitive(cfg, p)
+            if tool in ("Grep", "Glob", "LS") and scope_hit:
                 return PolicyResult("ask", f"search scope {p} contains protected paths", force_slack=True)
         if tool == "Grep" and glob_targets_protected(cfg, str(inp.get("glob") or "")):
             return PolicyResult("ask", "the glob filter can select protected files", force_slack=True)
